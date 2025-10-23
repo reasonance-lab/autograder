@@ -6,7 +6,7 @@ import json
 import logging
 import anthropic
 import re
-from pypdf import PdfReader
+import base64
 from typing import TypedDict, Any
 
 
@@ -23,15 +23,14 @@ def _generate_unique_filename(name: str) -> str:
     return f"{random_prefix}_{name}"
 
 
-def _extract_text_from_pdf(file_path: str) -> str:
-    """Extracts text from a PDF file."""
+def _encode_pdf_to_base64(file_path: str) -> str:
+    """Reads a PDF file and returns its base64-encoded representation."""
     try:
-        reader = PdfReader(file_path)
-        text = "".join((page.extract_text() for page in reader.pages))
-        return text
+        with open(file_path, "rb") as pdf_file:
+            return base64.b64encode(pdf_file.read()).decode("utf-8")
     except Exception as e:
         logging.exception(e)
-        print(f"Error extracting text from {file_path}: {e}")
+        print(f"Error encoding {file_path} to base64: {e}")
         return ""
 
 
@@ -160,11 +159,11 @@ class GradingState(rx.State):
             client = anthropic.Anthropic(api_key=api_key)
             upload_dir = rx.get_upload_dir()
             answer_key_path = upload_dir / self.answer_key_files[0]
-            answer_key_text = _extract_text_from_pdf(answer_key_path)
-            if not answer_key_text:
+            answer_key_base64 = _encode_pdf_to_base64(answer_key_path)
+            if not answer_key_base64:
                 async with self:
                     self.is_grading = False
-                yield rx.toast.error("Could not extract text from answer key.")
+                yield rx.toast.error("Could not process the answer key PDF.")
                 return
             total_papers = len(self.student_paper_files)
             for i, student_file in enumerate(self.student_paper_files):
@@ -174,28 +173,49 @@ class GradingState(rx.State):
                     )
                 yield
                 student_paper_path = upload_dir / student_file
-                student_paper_text = _extract_text_from_pdf(student_paper_path)
-                if not student_paper_text:
+                student_paper_base64 = _encode_pdf_to_base64(student_paper_path)
+                if not student_paper_base64:
                     result = GradingResult(
                         student_file=student_file,
                         grade="Error",
-                        feedback="Could not extract text from PDF.",
+                        feedback="Could not process the student paper PDF.",
                         report_file=None,
                     )
                     async with self:
                         self.grading_results.append(result)
                     continue
-                system_prompt = f"You are an expert teaching assistant. Grade the following student exam based on the provided answer key. \n                Provide a final grade and detailed, constructive feedback for each question. \n                {self.grading_instructions}\n\n                Format your response as a JSON object with two keys: 'grade' (a string like '85/100' or 'A-') and 'feedback' (a detailed markdown string).\n                "
+                system_prompt = f"You are an expert teaching assistant. Grade the student's exam PDF based on the answer key PDF provided. The user will provide two PDF documents. \n                Provide a final grade and detailed, constructive feedback for each question. \n                {self.grading_instructions}\n\n                Format your response as a JSON object with two keys: 'grade' (a string like '85/100' or 'A-') and 'feedback' (a detailed markdown string).\n                "
                 try:
                     message = (
                         client.messages.create(
                             model=self.selected_model,
-                            max_tokens=2048,
+                            max_tokens=4096,
                             system=system_prompt,
                             messages=[
                                 {
                                     "role": "user",
-                                    "content": f"Answer Key:\n\n{answer_key_text}\n\n---\n\nStudent Paper:\n\n{student_paper_text}",
+                                    "content": [
+                                        {
+                                            "type": "document",
+                                            "source": {
+                                                "type": "base64",
+                                                "media_type": "application/pdf",
+                                                "data": answer_key_base64,
+                                            },
+                                        },
+                                        {
+                                            "type": "document",
+                                            "source": {
+                                                "type": "base64",
+                                                "media_type": "application/pdf",
+                                                "data": student_paper_base64,
+                                            },
+                                        },
+                                        {
+                                            "type": "text",
+                                            "text": "Please grade the student paper based on the answer key.",
+                                        },
+                                    ],
                                 }
                             ],
                         )
