@@ -281,6 +281,36 @@ class GradingState(rx.State):
                     )
                     async with self:
                         self.grading_results.append(result)
+                except anthropic.AuthenticationError as e:
+                    logging.exception(e)
+                    async with self:
+                        self.is_grading = False
+                        self.grading_progress = "Authentication failed."
+                    yield rx.toast.error(
+                        "Invalid API key. Please check your ANTHROPIC_API_KEY.",
+                        duration=10000,
+                    )
+                    return
+                except anthropic.RateLimitError as e:
+                    logging.exception(e)
+                    async with self:
+                        self.is_grading = False
+                        self.grading_progress = "Rate limit exceeded."
+                    yield rx.toast.error(
+                        "API rate limit exceeded. Please wait and try again.",
+                        duration=10000,
+                    )
+                    return
+                except anthropic.APIConnectionError as e:
+                    logging.exception(e)
+                    async with self:
+                        self.is_grading = False
+                        self.grading_progress = "Network error."
+                    yield rx.toast.error(
+                        "Network error: Could not connect to Anthropic API.",
+                        duration=10000,
+                    )
+                    return
                 except Exception as e:
                     logging.exception(e)
                     result = GradingResult(
