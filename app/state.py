@@ -1,324 +1,534 @@
+"""
+State management for LLM Cross-Talk Analyzer with improved convergence logic.
+"""
 import reflex as rx
-import random
-import string
 import os
-import json
-import logging
+import asyncio
+import openai
 import anthropic
-import re
-import base64
-from typing import TypedDict, Any
-from reportlab.lib.pagesizes import letter
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.lib.units import inch
-from io import BytesIO
+from typing import Literal, TypedDict, cast
+import logging
+from collections import Counter
+import math
+
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
 
 
-class GradingResult(TypedDict):
-    student_file: str
-    grade: str
-    feedback: str
-    report_file: str | None
+class ModelResponse(TypedDict):
+    """Type definition for a single iteration response."""
+    iteration: int
+    openai_response: str
+    claude_response: str
+    similarity: float
+    change_rate: float
 
 
-def _generate_unique_filename(name: str) -> str:
-    """Generates a unique filename to avoid collisions."""
-    random_prefix = "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
-    return f"{random_prefix}_{name}"
+class ComparisonState(rx.State):
+    """Manages the state for the LLM comparison application with enhanced convergence."""
 
+    # Core state
+    prompt: str = ""
+    is_loading: bool = False
+    is_iterating: bool = False
+    automated_running: bool = False
+    converged: bool = False
+    mode: Literal["manual", "automated"] = "manual"
+    history: list[ModelResponse] = []
+    
+    # Configuration state
+    convergence_threshold: float = 0.90
+    max_iterations: int = 10
+    openai_model: str = "gpt-3.5-turbo"
+    claude_model: str = "claude-sonnet-4-5-20250929"
+    temperature: float = 0.7
+    
+    # Advanced settings visibility
+    show_settings: bool = False
+    
+    # Private clients
+    _openai_client: openai.OpenAI | None = None
+    _anthropic_client: anthropic.Anthropic | None = None
 
-def _encode_pdf_to_base64(file_path: str) -> str:
-    """Reads a PDF file and returns its base64-encoded representation."""
-    try:
-        with open(file_path, "rb") as pdf_file:
-            return base64.b64encode(pdf_file.read()).decode("utf-8")
-    except Exception as e:
-        logging.exception(e)
-        print(f"Error encoding {file_path} to base64: {e}")
-        return ""
-
-
-def _extract_json_from_markdown(text: str) -> str:
-    """Extracts a JSON object from a string, handling multiple formats."""
-    match = re.search("(?:json)?\\s*(\\{.*\\})\\s*", text, re.DOTALL)
-    if match:
-        try:
-            json.loads(match.group(1))
-            return match.group(1).strip()
-        except json.JSONDecodeError as e:
-            logging.exception(e)
-            pass
-    match = re.search("(\\{(?:[^{}]|\\{[^{}]*\\})*\\})", text)
-    if match:
-        try:
-            json.loads(match.group(1))
-            return match.group(1).strip()
-        except json.JSONDecodeError as e:
-            logging.exception(e)
-            pass
-    return ""
-
-
-def _create_pdf_report(result: GradingResult) -> bytes:
-    """Generates a PDF report from a grading result."""
-    buffer = BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=letter)
-    styles = getSampleStyleSheet()
-    story = []
-    story.append(Paragraph("Grading Report", styles["h1"]))
-    story.append(Spacer(1, 0.2 * inch))
-    story.append(
-        Paragraph(f"<b>Student File:</b> {result['student_file']}", styles["Normal"])
-    )
-    story.append(Paragraph(f"<b>Grade:</b> {result['grade']}", styles["Normal"]))
-    story.append(Spacer(1, 0.2 * inch))
-    story.append(Paragraph("<b>Feedback:</b>", styles["h2"]))
-    feedback_paragraphs = result["feedback"].split("""
-
-""")
-    for para in feedback_paragraphs:
-        if para.strip():
-            para = re.sub("\\*\\*(.*?)\\*\\*", "<b>\\1</b>", para)
-            para = re.sub("\\*(.*?)\\*", "<i>\\1</i>", para)
-            story.append(Paragraph(para, styles["BodyText"]))
-            story.append(Spacer(1, 0.1 * inch))
-    doc.build(story)
-    buffer.seek(0)
-    return buffer.getvalue()
-
-
-class GradingState(rx.State):
-    """Manages the state for the automated exam grading application."""
-
-    claude_models: list[str] = [
-        "claude-sonnet-4-5-20250929",
-        "claude-opus-4-1-20250805",
-        "claude-haiku-4-5-20251001",
-        "claude-sonnet-4-20250514",
-        "claude-opus-4-20250514",
-        "claude-3-7-sonnet-20250219",
-        "claude-3-5-sonnet-20241022",
-        "claude-3-5-haiku-20241022",
-    ]
-    selected_model: str = "claude-sonnet-4-5-20250929"
-    grading_instructions: str = ""
-    answer_key_files: list[str] = []
-    student_paper_files: list[str] = []
-    is_grading: bool = False
-    grading_progress: str = ""
-    grading_results: list[GradingResult] = []
-    grading_complete: bool = False
-
-    @rx.event
-    async def handle_answer_key_upload(self, files: list[rx.UploadFile]):
-        """Handle the upload of the answer key PDF."""
-        if not files:
-            return
-        file = files[0]
-        if file.content_type != "application/pdf":
-            return rx.toast.error("Answer key must be a PDF file.")
-        upload_data = await file.read()
-        upload_dir = rx.get_upload_dir()
-        upload_dir.mkdir(parents=True, exist_ok=True)
-        unique_filename = _generate_unique_filename(file.name)
-        file_path = upload_dir / unique_filename
-        with file_path.open("wb") as f:
-            f.write(upload_data)
-        self.answer_key_files = [unique_filename]
-        return rx.toast.success("Answer key uploaded successfully.")
-
-    @rx.event
-    async def handle_student_papers_upload(self, files: list[rx.UploadFile]):
-        """Handle the upload of student paper PDFs."""
-        if not files:
-            return
-        current_file_count = len(self.student_paper_files)
-        if current_file_count + len(files) > 20:
-            yield rx.toast.error(
-                f"Cannot upload more than 20 student papers. You have {current_file_count} already."
+    def _initialize_clients(self):
+        """Initializes API clients if they don't exist."""
+        if self._openai_client is None:
+            self._openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        if self._anthropic_client is None:
+            self._anthropic_client = anthropic.Anthropic(
+                api_key=os.getenv("ANTHROPIC_API_KEY")
             )
-            return
-        upload_dir = rx.get_upload_dir()
-        upload_dir.mkdir(parents=True, exist_ok=True)
-        uploaded_count = 0
-        for file in files:
-            if file.content_type != "application/pdf":
-                yield rx.toast.warning(f"Skipping '{file.name}' as it is not a PDF.")
-                continue
-            upload_data = await file.read()
-            unique_filename = _generate_unique_filename(file.name)
-            file_path = upload_dir / unique_filename
-            with file_path.open("wb") as f:
-                f.write(upload_data)
-            if unique_filename not in self.student_paper_files:
-                self.student_paper_files.append(unique_filename)
-                uploaded_count += 1
-        if uploaded_count > 0:
-            yield rx.toast.success(f"{uploaded_count} student paper(s) uploaded.")
-            return
-
-    @rx.event
-    def clear_answer_key(self):
-        """Clear the uploaded answer key."""
-        self.answer_key_files = []
-        self.grading_complete = False
-        self.grading_results = []
-        return rx.clear_selected_files("answer_key_upload")
-
-    @rx.event
-    def clear_student_papers(self):
-        """Clear all uploaded student papers."""
-        self.student_paper_files = []
-        self.grading_complete = False
-        self.grading_results = []
-        return rx.clear_selected_files("student_papers_upload")
-
-    @rx.event(background=True)
-    async def start_grading(self):
-        """Starts the grading process in the background."""
-        async with self:
-            self.is_grading = True
-            self.grading_complete = False
-            self.grading_results = []
-            self.grading_progress = "Initializing..."
-        try:
-            api_key = os.getenv("ANTHROPIC_API_KEY")
-            if not api_key:
-                async with self:
-                    self.is_grading = False
-                yield rx.toast.error("ANTHROPIC_API_KEY not set.")
-                return
-            client = anthropic.Anthropic(api_key=api_key)
-            upload_dir = rx.get_upload_dir()
-            answer_key_path = upload_dir / self.answer_key_files[0]
-            answer_key_base64 = _encode_pdf_to_base64(answer_key_path)
-            if not answer_key_base64:
-                async with self:
-                    self.is_grading = False
-                yield rx.toast.error("Could not process the answer key PDF.")
-                return
-            total_papers = len(self.student_paper_files)
-            for i, student_file in enumerate(self.student_paper_files):
-                async with self:
-                    self.grading_progress = (
-                        f"Processing student {i + 1} of {total_papers}..."
-                    )
-                yield
-                student_paper_path = upload_dir / student_file
-                student_paper_base64 = _encode_pdf_to_base64(student_paper_path)
-                if not student_paper_base64:
-                    result = GradingResult(
-                        student_file=student_file,
-                        grade="Error",
-                        feedback="Could not process the student paper PDF.",
-                        report_file=None,
-                    )
-                    async with self:
-                        self.grading_results.append(result)
-                    continue
-                system_prompt = f"You are an expert teaching assistant. Grade the student's exam PDF based on the answer key PDF provided. The user will provide two PDF documents. \n                Provide a final grade and detailed, constructive feedback for each question. \n                {self.grading_instructions}\n\n                Format your response as a JSON object with two keys: 'grade' (a string like '85/100' or 'A-') and 'feedback' (a detailed markdown string).\n                "
-                try:
-                    message = (
-                        client.messages.create(
-                            model=self.selected_model,
-                            max_tokens=4096,
-                            system=system_prompt,
-                            messages=[
-                                {
-                                    "role": "user",
-                                    "content": [
-                                        {
-                                            "type": "document",
-                                            "source": {
-                                                "type": "base64",
-                                                "media_type": "application/pdf",
-                                                "data": answer_key_base64,
-                                            },
-                                        },
-                                        {
-                                            "type": "document",
-                                            "source": {
-                                                "type": "base64",
-                                                "media_type": "application/pdf",
-                                                "data": student_paper_base64,
-                                            },
-                                        },
-                                        {
-                                            "type": "text",
-                                            "text": "Please grade the student paper based on the answer key.",
-                                        },
-                                    ],
-                                }
-                            ],
-                        )
-                        .content[0]
-                        .text
-                    )
-                    json_string = _extract_json_from_markdown(message)
-                    if not json_string:
-                        raise json.JSONDecodeError(
-                            "No JSON found in response", message, 0
-                        )
-                    response_json = json.loads(json_string)
-                    grade = response_json.get("grade", "Not found")
-                    feedback = response_json.get("feedback", "No feedback provided.")
-                    report = GradingResult(
-                        student_file=student_file,
-                        grade=grade,
-                        feedback=feedback,
-                        report_file=None,
-                    )
-                    async with self:
-                        self.grading_results.append(report)
-                except (json.JSONDecodeError, KeyError) as e:
-                    logging.exception(e)
-                    result = GradingResult(
-                        student_file=student_file,
-                        grade="API Error",
-                        feedback=f"Failed to parse AI response: {e}",
-                        report_file=None,
-                    )
-                    async with self:
-                        self.grading_results.append(result)
-                except Exception as e:
-                    logging.exception(e)
-                    result = GradingResult(
-                        student_file=student_file,
-                        grade="API Error",
-                        feedback=f"An error occurred with the Anthropic API: {e}",
-                        report_file=None,
-                    )
-                    async with self:
-                        self.grading_results.append(result)
-            async with self:
-                self.grading_complete = True
-                self.is_grading = False
-                self.grading_progress = "Grading complete!"
-            yield rx.toast.success("All papers graded successfully!")
-        except Exception as e:
-            logging.exception(e)
-            async with self:
-                self.is_grading = False
-                self.grading_progress = "An unexpected error occurred."
-            yield rx.toast.error(f"Grading failed: {e}")
-
-    @rx.event
-    def download_report(self, result: GradingResult):
-        """Generate and download a PDF report for a single result."""
-        try:
-            pdf_data = _create_pdf_report(result)
-            report_filename = f"report_{result['student_file'].replace('.pdf', '')}.pdf"
-            return rx.download(data=pdf_data, filename=report_filename)
-        except Exception as e:
-            logging.exception(e)
-            return rx.toast.error(f"Failed to generate PDF report: {e}")
 
     @rx.var
-    def can_start_grading(self) -> bool:
-        """Check if grading can be started."""
-        return (
-            len(self.answer_key_files) == 1
-            and len(self.student_paper_files) > 0
-            and (not self.is_grading)
-        )
+    def has_responses(self) -> bool:
+        """Check if there is any history to display."""
+        return len(self.history) > 0
+
+    @rx.var
+    def last_similarity_score(self) -> float:
+        """Returns the similarity score of the last iteration as percentage."""
+        if not self.history:
+            return 0.0
+        return self.history[-1]["similarity"] * 100
+
+    @rx.var
+    def current_iteration_count(self) -> int:
+        """Returns the current iteration count."""
+        return len(self.history)
+
+    @rx.var
+    def convergence_status(self) -> str:
+        """Returns a human-readable convergence status."""
+        if not self.history:
+            return "No iterations yet"
+        
+        last_similarity = self.history[-1]["similarity"]
+        threshold_pct = self.convergence_threshold * 100
+        
+        if last_similarity >= self.convergence_threshold:
+            return f"✓ Converged at {last_similarity * 100:.1f}% similarity"
+        elif len(self.history) >= self.max_iterations:
+            return f"Max iterations reached ({self.max_iterations})"
+        else:
+            gap = (self.convergence_threshold - last_similarity) * 100
+            return f"Need {gap:.1f}% more to reach {threshold_pct:.0f}% threshold"
+
+    @rx.event
+    def set_mode(self, new_mode: Literal["manual", "automated"]):
+        """Set the evaluation mode."""
+        self.mode = new_mode
+
+    @rx.event
+    def toggle_settings(self):
+        """Toggle settings panel visibility."""
+        self.show_settings = not self.show_settings
+
+    @rx.event
+    def update_convergence_threshold(self, value: list[float]):
+        """Update convergence threshold from slider."""
+        if value and len(value) > 0:
+            self.convergence_threshold = value[0]
+
+    @rx.event
+    def update_max_iterations(self, value: list[int]):
+        """Update max iterations from slider."""
+        if value and len(value) > 0:
+            self.max_iterations = int(value[0])
+
+    @rx.event
+    def update_temperature(self, value: list[float]):
+        """Update temperature from slider."""
+        if value and len(value) > 0:
+            self.temperature = value[0]
+
+    @rx.event
+    def clear_all(self):
+        """Clear all history and reset state."""
+        self.history = []
+        self.converged = False
+        self.automated_running = False
+        self.is_iterating = False
+        self.prompt = ""
+
+    @rx.event(background=True)
+    async def get_initial_responses(self, form_data: dict):
+        """Fetches initial responses from both OpenAI and Claude."""
+        async with self:
+            self.prompt = form_data.get("prompt", "")
+            if not self.prompt or not self.prompt.strip():
+                yield rx.toast.error("Please enter a prompt.", duration=3000)
+                return
+            
+            self.is_loading = True
+            self.is_iterating = False
+            self.automated_running = False
+            self.converged = False
+            self.history = []
+            self._initialize_clients()
+
+        try:
+            openai_task = self._fetch_openai(self.prompt)
+            claude_task = self._fetch_claude(self.prompt)
+            openai_res, claude_res = await asyncio.gather(openai_task, claude_task)
+
+            if openai_res is None or claude_res is None:
+                async with self:
+                    self.is_loading = False
+                if openai_res is None:
+                    yield rx.toast.error("OpenAI failed to respond.", duration=5000)
+                if claude_res is None:
+                    yield rx.toast.error("Claude failed to respond.", duration=5000)
+                return
+
+            similarity = self._cosine_similarity(openai_res, claude_res)
+
+            async with self:
+                initial_responses: ModelResponse = {
+                    "iteration": 1,
+                    "openai_response": openai_res,
+                    "claude_response": claude_res,
+                    "similarity": similarity,
+                    "change_rate": 0.0,  # First iteration has no change
+                }
+                self.history.append(initial_responses)
+                
+                # Auto-start if in automated mode
+                if self.mode == "automated":
+                    yield ComparisonState.run_automated_cycle
+
+        except Exception as e:
+            logging.exception(f"Error fetching initial responses: {e}")
+            yield rx.toast.error(f"An unexpected error occurred: {e}", duration=5000)
+        finally:
+            async with self:
+                self.is_loading = False
+
+    @rx.event(background=True)
+    async def iterate_manual_mode(self):
+        """Performs one round of cross-evaluation in manual mode."""
+        async with self:
+            if not self.history:
+                return
+            
+            self.is_iterating = True
+            self._initialize_clients()
+            
+            last_iteration = self.history[-1]
+            openai_previous = last_iteration["openai_response"]
+            claude_previous = last_iteration["claude_response"]
+
+            # Generic prompt template (domain-agnostic)
+            new_prompt_template = """Original User Request:
+{original_prompt}
+
+Your Previous Response:
+---
+{your_previous_response}
+---
+
+Alternative Response from Another Model:
+---
+{other_model_response}
+---
+
+Instructions:
+- Carefully review BOTH responses against the original user request
+- Identify the strengths and weaknesses of each approach
+- If the alternative response has superior reasoning, insights, or completeness, integrate those elements
+- Eliminate purely stylistic differences (formatting, phrasing variations that don't affect meaning)
+- Synthesize the best aspects of both responses into a refined answer
+- DO NOT add meta-commentary about the comparison process
+- Output ONLY your refined, complete response to the original user request"""
+
+            openai_new_prompt = new_prompt_template.format(
+                original_prompt=self.prompt,
+                your_previous_response=openai_previous,
+                other_model_response=claude_previous,
+            )
+            claude_new_prompt = new_prompt_template.format(
+                original_prompt=self.prompt,
+                your_previous_response=claude_previous,
+                other_model_response=openai_previous,
+            )
+
+        try:
+            openai_task = self._fetch_openai(openai_new_prompt)
+            claude_task = self._fetch_claude(claude_new_prompt)
+            openai_res, claude_res = await asyncio.gather(openai_task, claude_task)
+
+            async with self:
+                if openai_res is None or claude_res is None:
+                    self.is_iterating = False
+                    if openai_res is None:
+                        yield rx.toast.error(
+                            "OpenAI failed to respond during iteration.", duration=5000
+                        )
+                    if claude_res is None:
+                        yield rx.toast.error(
+                            "Claude failed to respond during iteration.", duration=5000
+                        )
+                    return
+
+                similarity = self._cosine_similarity(openai_res, claude_res)
+                
+                # Calculate change rate
+                prev_similarity = last_iteration["similarity"]
+                change_rate = abs(similarity - prev_similarity)
+
+                new_iteration: ModelResponse = {
+                    "iteration": len(self.history) + 1,
+                    "openai_response": openai_res,
+                    "claude_response": claude_res,
+                    "similarity": similarity,
+                    "change_rate": change_rate,
+                }
+                self.history.append(new_iteration)
+                
+                # Check for convergence
+                if similarity >= self.convergence_threshold:
+                    self.converged = True
+                    yield rx.toast.success(
+                        f"Convergence reached! Similarity: {similarity * 100:.1f}%",
+                        duration=5000
+                    )
+
+        except Exception as e:
+            logging.exception(f"Error during iteration: {e}")
+            yield rx.toast.error(
+                f"An unexpected error occurred during iteration: {e}", duration=5000
+            )
+        finally:
+            async with self:
+                self.is_iterating = False
+
+    @rx.event(background=True)
+    async def run_automated_cycle(self):
+        """Runs the automated cross-evaluation until convergence or max iterations."""
+        async with self:
+            if not self.history or self.automated_running:
+                return
+            self.automated_running = True
+            self.converged = False
+
+        oscillation_count = 0
+        
+        while True:
+            async with self:
+                if not self.automated_running:
+                    break
+
+                last_iteration = self.history[-1]
+                current_iter_count = last_iteration["iteration"]
+                similarity = last_iteration["similarity"]
+
+                # Check convergence conditions
+                if similarity >= self.convergence_threshold:
+                    self.converged = True
+                    self.automated_running = False
+                    yield rx.toast.success(
+                        f"✓ Converged at {similarity * 100:.1f}% similarity!",
+                        duration=5000
+                    )
+                    break
+
+                if current_iter_count >= self.max_iterations:
+                    self.converged = False
+                    self.automated_running = False
+                    yield rx.toast.warning(
+                        f"Max iterations ({self.max_iterations}) reached. Final similarity: {similarity * 100:.1f}%",
+                        duration=5000
+                    )
+                    break
+
+                # Detect oscillation (similarity not improving)
+                if len(self.history) >= 3:
+                    recent_changes = [h["change_rate"] for h in self.history[-3:]]
+                    avg_change = sum(recent_changes) / len(recent_changes)
+                    
+                    if avg_change < 0.01:  # Less than 1% change on average
+                        oscillation_count += 1
+                        if oscillation_count >= 2:
+                            self.automated_running = False
+                            yield rx.toast.warning(
+                                f"Responses stabilized at {similarity * 100:.1f}% similarity without reaching threshold.",
+                                duration=5000
+                            )
+                            break
+                    else:
+                        oscillation_count = 0
+
+                self._initialize_clients()
+                openai_previous = last_iteration["openai_response"]
+                claude_previous = last_iteration["claude_response"]
+
+                # Generic prompt template
+                new_prompt_template = """Original User Request:
+{original_prompt}
+
+Your Previous Response:
+---
+{your_previous_response}
+---
+
+Alternative Response from Another Model:
+---
+{other_model_response}
+---
+
+Instructions:
+- Carefully review BOTH responses against the original user request
+- Identify the strengths and weaknesses of each approach
+- If the alternative response has superior reasoning, insights, or completeness, integrate those elements
+- Eliminate purely stylistic differences (formatting, phrasing variations that don't affect meaning)
+- Synthesize the best aspects of both responses into a refined answer
+- DO NOT add meta-commentary about the comparison process
+- Output ONLY your refined, complete response to the original user request"""
+
+                openai_new_prompt = new_prompt_template.format(
+                    original_prompt=self.prompt,
+                    your_previous_response=openai_previous,
+                    other_model_response=claude_previous,
+                )
+                claude_new_prompt = new_prompt_template.format(
+                    original_prompt=self.prompt,
+                    your_previous_response=claude_previous,
+                    other_model_response=openai_previous,
+                )
+
+            try:
+                openai_task = self._fetch_openai(openai_new_prompt)
+                claude_task = self._fetch_claude(claude_new_prompt)
+                openai_res, claude_res = await asyncio.gather(openai_task, claude_task)
+
+                if openai_res is None or claude_res is None:
+                    async with self:
+                        self.automated_running = False
+                    if openai_res is None:
+                        yield rx.toast.error(
+                            "OpenAI failed during automated cycle.", duration=5000
+                        )
+                    if claude_res is None:
+                        yield rx.toast.error(
+                            "Claude failed during automated cycle.", duration=5000
+                        )
+                    break
+
+                new_similarity = self._cosine_similarity(openai_res, claude_res)
+                
+                # Calculate change rate
+                prev_similarity = last_iteration["similarity"]
+                change_rate = abs(new_similarity - prev_similarity)
+
+                async with self:
+                    new_iteration: ModelResponse = {
+                        "iteration": current_iter_count + 1,
+                        "openai_response": openai_res,
+                        "claude_response": claude_res,
+                        "similarity": new_similarity,
+                        "change_rate": change_rate,
+                    }
+                    self.history.append(new_iteration)
+
+            except Exception as e:
+                async with self:
+                    self.automated_running = False
+                logging.exception(f"Error during automated iteration: {e}")
+                yield rx.toast.error(
+                    f"Unexpected error in automated cycle: {e}", duration=5000
+                )
+                break
+
+            # Small delay between iterations to prevent rate limiting
+            await asyncio.sleep(0.5)
+            yield
+
+        async with self:
+            self.automated_running = False
+
+    @rx.event
+    def stop_automated_cycle(self):
+        """Stops the automated evaluation cycle."""
+        self.automated_running = False
+
+    def _is_response_complete(self, response_text: str) -> bool:
+        """Check if the AI response appears to be complete."""
+        stripped_text = response_text.strip()
+        
+        # Check for common markdown code fence closure
+        if "```" in stripped_text:
+            return stripped_text.count("```") % 2 == 0
+        
+        return True
+
+    def _cosine_similarity(self, text1: str, text2: str) -> float:
+        """
+        Calculate cosine similarity between two texts.
+        Returns 0.0 if either response is incomplete or invalid.
+        """
+        if not self._is_response_complete(text1) or not self._is_response_complete(text2):
+            return 0.0
+
+        if (
+            not text1
+            or not text2
+            or text1.startswith("Error:")
+            or text2.startswith("Error:")
+        ):
+            return 0.0
+
+        # Tokenize and count word frequencies
+        vec1 = Counter(text1.lower().split())
+        vec2 = Counter(text2.lower().split())
+
+        # Calculate intersection
+        intersection = set(vec1.keys()) & set(vec2.keys())
+        numerator = sum((vec1[x] * vec2[x] for x in intersection))
+
+        # Calculate magnitudes
+        sum1 = sum((vec1[x] ** 2 for x in vec1.keys()))
+        sum2 = sum((vec2[x] ** 2 for x in vec2.keys()))
+        denominator = math.sqrt(sum1) * math.sqrt(sum2)
+
+        if not denominator:
+            return 0.0
+
+        return float(numerator) / denominator
+
+    async def _fetch_openai(self, current_prompt: str) -> str | None:
+        """Helper to fetch response from OpenAI."""
+        client = cast(openai.OpenAI, self._openai_client)
+        try:
+            system_message = "You are a helpful assistant. Your goal is to collaborate with another AI to converge on a single, optimal response. Focus on substance and accuracy over stylistic differences."
+            
+            response = await asyncio.to_thread(
+                client.chat.completions.create,
+                model=self.openai_model,
+                messages=[
+                    {"role": "system", "content": system_message},
+                    {"role": "user", "content": current_prompt}
+                ],
+                max_tokens=2048,
+                temperature=self.temperature,
+            )
+            
+            response_text = (
+                response.choices[0].message.content.strip() if response.choices else ""
+            )
+            
+            if not response_text:
+                logging.warning("OpenAI returned an empty response.")
+                return None
+            
+            return response_text
+            
+        except Exception as e:
+            logging.exception(f"OpenAI API error: {e}")
+            return None
+
+    async def _fetch_claude(self, current_prompt: str) -> str | None:
+        """Helper to fetch response from Anthropic Claude."""
+        client = cast(anthropic.Anthropic, self._anthropic_client)
+        try:
+            system_message = "You are a helpful assistant. Your goal is to collaborate with another AI to converge on a single, optimal response. Focus on substance and accuracy over stylistic differences."
+            
+            message = await asyncio.to_thread(
+                client.messages.create,
+                model=self.claude_model,
+                system=system_message,
+                max_tokens=2048,
+                messages=[{"role": "user", "content": current_prompt}],
+                temperature=self.temperature,
+            )
+            
+            response_text = message.content[0].text.strip() if message.content else ""
+            
+            if not response_text:
+                logging.warning("Claude returned an empty response.")
+                return None
+            
+            return response_text
+            
+        except Exception as e:
+            logging.exception(f"Anthropic API error: {e}")
+            return None
