@@ -5,6 +5,7 @@ import os
 import json
 import logging
 import anthropic
+import re
 from pypdf import PdfReader
 from typing import TypedDict, Any
 
@@ -32,6 +33,16 @@ def _extract_text_from_pdf(file_path: str) -> str:
         logging.exception(e)
         print(f"Error extracting text from {file_path}: {e}")
         return ""
+
+
+def _extract_json_from_markdown(markdown_string: str) -> str:
+    """Extracts a JSON object from a markdown code block."""
+    match = re.search("on\\n({.*?})\\n", markdown_string, re.DOTALL)
+    if match:
+        return match.group(1)
+    if markdown_string.strip().startswith("{"):
+        return markdown_string
+    return ""
 
 
 class GradingState(rx.State):
@@ -180,7 +191,12 @@ class GradingState(rx.State):
                         .content[0]
                         .text
                     )
-                    response_json = json.loads(message)
+                    json_string = _extract_json_from_markdown(message)
+                    if not json_string:
+                        raise json.JSONDecodeError(
+                            "No JSON found in response", message, 0
+                        )
+                    response_json = json.loads(json_string)
                     grade = response_json.get("grade", "Not found")
                     feedback = response_json.get("feedback", "No feedback provided.")
                     report = GradingResult(
