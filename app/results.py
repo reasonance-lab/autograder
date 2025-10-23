@@ -28,9 +28,18 @@ def _report_card(result: GradingResult) -> rx.Component:
                 ),
                 class_name="mt-4 h-64 overflow-y-auto p-2 bg-gray-50 rounded-lg border",
             ),
-            class_name="p-4",
+            rx.el.div(
+                rx.el.button(
+                    rx.icon("download", class_name="w-4 h-4 mr-2"),
+                    "Download Report",
+                    on_click=lambda: GradingState.download_report(result),
+                    class_name="w-full flex items-center justify-center px-4 py-2 mt-4 text-xs font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 transition-colors",
+                ),
+                class_name="px-4 pb-4",
+            ),
+            class_name="flex flex-col",
         ),
-        class_name="bg-white rounded-xl border border-gray-200 shadow-sm hover:shadow-lg transition-all",
+        class_name="bg-white rounded-xl border border-gray-200 shadow-sm hover:shadow-lg transition-all flex flex-col justify-between",
     )
 
 

@@ -8,6 +8,11 @@ import anthropic
 import re
 import base64
 from typing import TypedDict, Any
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.units import inch
+from io import BytesIO
 
 
 class GradingResult(TypedDict):
@@ -53,6 +58,34 @@ def _extract_json_from_markdown(text: str) -> str:
             logging.exception(e)
             pass
     return ""
+
+
+def _create_pdf_report(result: GradingResult) -> bytes:
+    """Generates a PDF report from a grading result."""
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter)
+    styles = getSampleStyleSheet()
+    story = []
+    story.append(Paragraph("Grading Report", styles["h1"]))
+    story.append(Spacer(1, 0.2 * inch))
+    story.append(
+        Paragraph(f"<b>Student File:</b> {result['student_file']}", styles["Normal"])
+    )
+    story.append(Paragraph(f"<b>Grade:</b> {result['grade']}", styles["Normal"]))
+    story.append(Spacer(1, 0.2 * inch))
+    story.append(Paragraph("<b>Feedback:</b>", styles["h2"]))
+    feedback_paragraphs = result["feedback"].split("""
+
+""")
+    for para in feedback_paragraphs:
+        if para.strip():
+            para = re.sub("\\*\\*(.*?)\\*\\*", "<b>\\1</b>", para)
+            para = re.sub("\\*(.*?)\\*", "<i>\\1</i>", para)
+            story.append(Paragraph(para, styles["BodyText"]))
+            story.append(Spacer(1, 0.1 * inch))
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.getvalue()
 
 
 class GradingState(rx.State):
@@ -269,6 +302,17 @@ class GradingState(rx.State):
                 self.is_grading = False
                 self.grading_progress = "An unexpected error occurred."
             yield rx.toast.error(f"Grading failed: {e}")
+
+    @rx.event
+    def download_report(self, result: GradingResult):
+        """Generate and download a PDF report for a single result."""
+        try:
+            pdf_data = _create_pdf_report(result)
+            report_filename = f"report_{result['student_file'].replace('.pdf', '')}.pdf"
+            return rx.download(data=pdf_data, filename=report_filename)
+        except Exception as e:
+            logging.exception(e)
+            return rx.toast.error(f"Failed to generate PDF report: {e}")
 
     @rx.var
     def can_start_grading(self) -> bool:
