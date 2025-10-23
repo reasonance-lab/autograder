@@ -35,13 +35,24 @@ def _extract_text_from_pdf(file_path: str) -> str:
         return ""
 
 
-def _extract_json_from_markdown(markdown_string: str) -> str:
-    """Extracts a JSON object from a markdown code block."""
-    match = re.search("(?:json)?\\s*(\\{.*?\\})\\s*", markdown_string, re.DOTALL)
+def _extract_json_from_markdown(text: str) -> str:
+    """Extracts a JSON object from a string, handling multiple formats."""
+    match = re.search("(?:json)?\\s*(\\{.*\\})\\s*", text, re.DOTALL)
     if match:
-        return match.group(1).strip()
-    if markdown_string.strip().startswith("{"):
-        return markdown_string.strip()
+        try:
+            json.loads(match.group(1))
+            return match.group(1).strip()
+        except json.JSONDecodeError as e:
+            logging.exception(e)
+            pass
+    match = re.search("(\\{(?:[^{}]|\\{[^{}]*\\})*\\})", text)
+    if match:
+        try:
+            json.loads(match.group(1))
+            return match.group(1).strip()
+        except json.JSONDecodeError as e:
+            logging.exception(e)
+            pass
     return ""
 
 
