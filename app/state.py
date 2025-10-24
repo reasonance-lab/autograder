@@ -419,6 +419,19 @@ Output: Table for the MCQ section of student answers compared to the answer key/
             logging.exception(e)
             return rx.toast.error(f"Failed to generate PDF report: {e}")
 
+    @rx.event
+    def download_html_report(self, result: GradingResult):
+        """Generate and download an HTML report for a single result."""
+        try:
+            html_content = f"<!DOCTYPE html>\n<html lang='en'>\n<head>\n    <meta charset='UTF-8'>\n    <meta name='viewport' content='width=device-width, initial-scale=1.0'>\n    <title>Grading Report: {result['student_file']}</title>\n    <style>\n        body {{ font-family: sans-serif; line-height: 1.6; padding: 2em; max-width: 800px; margin: auto; color: #333; }}\n        h1, h2, h3 {{ color: #222; }}\n        pre {{ background-color: #f4f4f4; padding: 1em; border-radius: 5px; white-space: pre-wrap; word-wrap: break-word; }}\n        code {{ font-family: monospace; }}\n        table {{ border-collapse: collapse; width: 100%; margin-bottom: 1em; }}\n        th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}\n        th {{ background-color: #f2f2f2; }}\n        sub {{ font-size: 0.75em; line-height: 0; position: relative; vertical-align: baseline; bottom: -0.25em; }}\n    </style>\n</head>\n<body>\n    <h1>Grading Report</h1>\n    <p><b>Student File:</b> {result['student_file']}</p>\n    <p><b>Grade:</b> {result['grade']}</p>\n    <hr>\n    <h2>Feedback</h2>\n    {result['html_feedback']}\n</body>\n</html>"
+            report_filename = (
+                f"report_{result['student_file'].replace('.pdf', '')}.html"
+            )
+            return rx.download(data=html_content, filename=report_filename)
+        except Exception as e:
+            logging.exception(e)
+            return rx.toast.error(f"Failed to generate HTML report: {e}")
+
     @rx.var
     def can_start_grading(self) -> bool:
         """Check if grading can be started."""
