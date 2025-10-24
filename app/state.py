@@ -80,7 +80,7 @@ def _create_pdf_report(result: GradingResult) -> bytes:
     story.append(Paragraph(f"<b>Grade:</b> {result['grade']}", styles["Normal"]))
     story.append(Spacer(1, 0.2 * inch))
     story.append(Paragraph("<b>Feedback:</b>", styles["h2"]))
-    feedback_paragraphs = result["feedback"].split("""
+    feedback_paragraphs = result["formatted_feedback"].split("""
 
 """)
     for para in feedback_paragraphs:
