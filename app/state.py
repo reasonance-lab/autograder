@@ -16,6 +16,10 @@ from reportlab.lib.enums import TA_LEFT
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from io import BytesIO
+from markdown import markdown
+from reportlab.platypus.flowables import HRFlowable
+from reportlab.lib.colors import HexColor
+from html.parser import HTMLParser
 
 
 def _format_chemical_formulas(text: str) -> str:
@@ -28,7 +32,7 @@ class GradingResult(TypedDict):
     grade: str
     feedback: str
     report_file: str | None
-    formatted_feedback: str
+    html_feedback: str
 
 
 def _generate_unique_filename(name: str) -> str:
@@ -69,22 +73,70 @@ def _extract_json_from_markdown(text: str) -> str:
     return ""
 
 
+class HTMLToPDFParser(HTMLParser):
+    def __init__(self, styles):
+        super().__init__()
+        self.styles = styles
+        self.story = []
+        self.tag_stack = []
+        self.current_text = ""
+
+    def handle_starttag(self, tag, attrs):
+        self._process_text()
+        self.tag_stack.append(tag)
+
+    def handle_endtag(self, tag):
+        self._process_text()
+        if self.tag_stack and self.tag_stack[-1] == tag:
+            self.tag_stack.pop()
+        if tag in ["p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "blockquote"]:
+            self.story.append(Spacer(1, 0.1 * inch))
+
+    def handle_data(self, data):
+        self.current_text += data
+
+    def handle_startendtag(self, tag, attrs):
+        if tag == "hr":
+            self._process_text()
+            self.story.append(
+                HRFlowable(width="100%", thickness=1, color=HexColor("#cccccc"))
+            )
+
+    def _process_text(self):
+        if not self.current_text.strip():
+            self.current_text = ""
+            return
+        text = self.current_text
+        style = self.styles["BodyText"]
+        if "h1" in self.tag_stack:
+            style = self.styles["h1"]
+        elif "h2" in self.tag_stack:
+            style = self.styles["h2"]
+        elif "h3" in self.tag_stack:
+            style = self.styles["h3"]
+        elif "li" in self.tag_stack:
+            text = f"• {text}"
+            style.leftIndent = 20
+        if "strong" in self.tag_stack or "b" in self.tag_stack:
+            text = f"<b>{text}</b>"
+        if "em" in self.tag_stack or "i" in self.tag_stack:
+            text = f"<i>{text}</i>"
+        text = re.sub("<sub>(.*?)</sub>", '<font size="7" rise="-2">\\1</font>', text)
+        self.story.append(Paragraph(text, style))
+        self.current_text = ""
+
+    def get_story(self):
+        self._process_text()
+        return self.story
+
+
 def _create_pdf_report(result: GradingResult) -> bytes:
     """Generates a PDF report from a grading result."""
     buffer = BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=letter)
     styles = getSampleStyleSheet()
-
-    # Create a custom style that properly handles subscripts and special characters
-    custom_body_style = ParagraphStyle(
-        'CustomBody',
-        parent=styles['BodyText'],
-        fontName='Helvetica',
-        fontSize=10,
-        leading=14,
-        alignment=TA_LEFT,
-    )
-
+    html_feedback = markdown(result["feedback"])
+    html_feedback_with_subs = _format_chemical_formulas(html_feedback)
     story = []
     story.append(Paragraph("Grading Report", styles["h1"]))
     story.append(Spacer(1, 0.2 * inch))
@@ -93,29 +145,11 @@ def _create_pdf_report(result: GradingResult) -> bytes:
     )
     story.append(Paragraph(f"<b>Grade:</b> {result['grade']}", styles["Normal"]))
     story.append(Spacer(1, 0.2 * inch))
-    story.append(Paragraph("<b>Feedback:</b>", styles["h2"]))
-
-    feedback_paragraphs = result["formatted_feedback"].split("\n\n")
-    for para in feedback_paragraphs:
-        if para.strip():
-            # Convert markdown bold and italic
-            para = re.sub(r"\*\*(.*?)\*\*", r"<b>\1</b>", para)
-            para = re.sub(r"\*(.*?)\*", r"<i>\1</i>", para)
-
-            # Ensure subscripts are properly formatted for reportlab
-            # Use smaller font size and negative rise for better rendering
-            para = re.sub(r"<sub>(.*?)</sub>", r'<font size="7" rise="-2">\1</font>', para)
-
-            try:
-                story.append(Paragraph(para, custom_body_style))
-                story.append(Spacer(1, 0.1 * inch))
-            except Exception as e:
-                # Fallback: if paragraph fails, try without special formatting
-                logging.warning(f"Failed to render paragraph with formatting: {e}")
-                plain_para = re.sub(r'<[^>]+>', '', para)
-                story.append(Paragraph(plain_para, custom_body_style))
-                story.append(Spacer(1, 0.1 * inch))
-
+    story.append(Paragraph("Feedback", styles["h2"]))
+    story.append(Spacer(1, 0.1 * inch))
+    parser = HTMLToPDFParser(styles)
+    parser.feed(html_feedback_with_subs)
+    story.extend(parser.get_story())
     doc.build(story)
     buffer.seek(0)
     return buffer.getvalue()
@@ -143,6 +177,7 @@ Output: Table for the MCQ section of student answers compared to the answer key/
     grading_progress: str = ""
     grading_results: list[GradingResult] = []
     grading_complete: bool = False
+    html_feedback: str = ""
 
     @rx.event
     async def handle_answer_key_upload(self, files: list[rx.UploadFile]):
@@ -247,7 +282,7 @@ Output: Table for the MCQ section of student answers compared to the answer key/
                         grade="Error",
                         feedback="Could not process the student paper PDF.",
                         report_file=None,
-                        formatted_feedback="Could not process the student paper PDF.",
+                        html_feedback="<p>Could not process the student paper PDF.</p>",
                     )
                     async with self:
                         self.grading_results.append(result)
@@ -298,13 +333,14 @@ Output: Table for the MCQ section of student answers compared to the answer key/
                     response_json = json.loads(json_string)
                     grade = response_json.get("grade", "Not found")
                     feedback = response_json.get("feedback", "No feedback provided.")
-                    formatted_feedback = _format_chemical_formulas(feedback)
+                    html_feedback = markdown(feedback)
+                    html_feedback_with_subs = _format_chemical_formulas(html_feedback)
                     report = GradingResult(
                         student_file=student_file,
                         grade=grade,
                         feedback=feedback,
                         report_file=None,
-                        formatted_feedback=formatted_feedback,
+                        html_feedback=html_feedback_with_subs,
                     )
                     async with self:
                         self.grading_results.append(report)
@@ -315,7 +351,7 @@ Output: Table for the MCQ section of student answers compared to the answer key/
                         grade="API Error",
                         feedback=f"Failed to parse AI response: {e}",
                         report_file=None,
-                        formatted_feedback=f"Failed to parse AI response: {e}",
+                        html_feedback=f"<p>Failed to parse AI response: {e}</p>",
                     )
                     async with self:
                         self.grading_results.append(result)
@@ -356,7 +392,7 @@ Output: Table for the MCQ section of student answers compared to the answer key/
                         grade="API Error",
                         feedback=f"An error occurred with the Anthropic API: {e}",
                         report_file=None,
-                        formatted_feedback=f"An error occurred with the Anthropic API: {e}",
+                        html_feedback=f"<p>An error occurred with the Anthropic API: {e}</p>",
                     )
                     async with self:
                         self.grading_results.append(result)
