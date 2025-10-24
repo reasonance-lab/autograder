@@ -10,8 +10,11 @@ import base64
 from typing import TypedDict, Any
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
+from reportlab.lib.enums import TA_LEFT
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 from io import BytesIO
 
 
@@ -71,6 +74,17 @@ def _create_pdf_report(result: GradingResult) -> bytes:
     buffer = BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=letter)
     styles = getSampleStyleSheet()
+
+    # Create a custom style that properly handles subscripts and special characters
+    custom_body_style = ParagraphStyle(
+        'CustomBody',
+        parent=styles['BodyText'],
+        fontName='Helvetica',
+        fontSize=10,
+        leading=14,
+        alignment=TA_LEFT,
+    )
+
     story = []
     story.append(Paragraph("Grading Report", styles["h1"]))
     story.append(Spacer(1, 0.2 * inch))
@@ -80,15 +94,28 @@ def _create_pdf_report(result: GradingResult) -> bytes:
     story.append(Paragraph(f"<b>Grade:</b> {result['grade']}", styles["Normal"]))
     story.append(Spacer(1, 0.2 * inch))
     story.append(Paragraph("<b>Feedback:</b>", styles["h2"]))
-    feedback_paragraphs = result["formatted_feedback"].split("""
 
-""")
+    feedback_paragraphs = result["formatted_feedback"].split("\n\n")
     for para in feedback_paragraphs:
         if para.strip():
-            para = re.sub("\\*\\*(.*?)\\*\\*", "<b>\\1</b>", para)
-            para = re.sub("\\*(.*?)\\*", "<i>\\1</i>", para)
-            story.append(Paragraph(para, styles["BodyText"]))
-            story.append(Spacer(1, 0.1 * inch))
+            # Convert markdown bold and italic
+            para = re.sub(r"\*\*(.*?)\*\*", r"<b>\1</b>", para)
+            para = re.sub(r"\*(.*?)\*", r"<i>\1</i>", para)
+
+            # Ensure subscripts are properly formatted for reportlab
+            # Use smaller font size and negative rise for better rendering
+            para = re.sub(r"<sub>(.*?)</sub>", r'<font size="7" rise="-2">\1</font>', para)
+
+            try:
+                story.append(Paragraph(para, custom_body_style))
+                story.append(Spacer(1, 0.1 * inch))
+            except Exception as e:
+                # Fallback: if paragraph fails, try without special formatting
+                logging.warning(f"Failed to render paragraph with formatting: {e}")
+                plain_para = re.sub(r'<[^>]+>', '', para)
+                story.append(Paragraph(plain_para, custom_body_style))
+                story.append(Spacer(1, 0.1 * inch))
+
     doc.build(story)
     buffer.seek(0)
     return buffer.getvalue()

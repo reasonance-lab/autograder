@@ -185,6 +185,31 @@ app = rx.App(
             href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap",
             rel="stylesheet",
         ),
+        rx.el.style("""
+            /* Enhanced subscript rendering for chemical formulas */
+            sub {
+                font-size: 0.7em;
+                line-height: 0;
+                position: relative;
+                vertical-align: baseline;
+                bottom: -0.25em;
+                font-variant-numeric: normal;
+            }
+
+            /* Ensure subscripts render properly in prose content */
+            .prose sub {
+                font-size: 0.7em;
+                line-height: 0;
+                position: relative;
+                vertical-align: baseline;
+                bottom: -0.25em;
+            }
+
+            /* Better rendering for chemical formulas */
+            .prose {
+                font-feature-settings: 'subs' 1;
+            }
+        """),
     ],
 )
 app.add_page(index, title="Automated Exam Grading")
