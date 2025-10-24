@@ -25,6 +25,9 @@ def _report_card(result: GradingResult) -> rx.Component:
                 rx.markdown(
                     result["feedback"],
                     class_name="prose prose-sm max-w-none text-gray-600",
+                    custom_attrs={
+                        "style": {"sub": {"fontFeatureSettings": "'sub' on"}}
+                    },
                 ),
                 class_name="mt-4 h-64 overflow-y-auto p-2 bg-gray-50 rounded-lg border",
             ),
