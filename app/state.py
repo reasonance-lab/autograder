@@ -15,11 +15,17 @@ from reportlab.lib.units import inch
 from io import BytesIO
 
 
+def _format_chemical_formulas(text: str) -> str:
+    """Converts chemical formulas like H2O to H<sub>2</sub>O for HTML rendering."""
+    return re.sub("([A-Z][a-z]?)(\\d+)", "\\1<sub>\\2</sub>", text)
+
+
 class GradingResult(TypedDict):
     student_file: str
     grade: str
     feedback: str
     report_file: str | None
+    formatted_feedback: str
 
 
 def _generate_unique_filename(name: str) -> str:
@@ -214,6 +220,7 @@ Output: Table for the MCQ section of student answers compared to the answer key/
                         grade="Error",
                         feedback="Could not process the student paper PDF.",
                         report_file=None,
+                        formatted_feedback="Could not process the student paper PDF.",
                     )
                     async with self:
                         self.grading_results.append(result)
@@ -264,11 +271,13 @@ Output: Table for the MCQ section of student answers compared to the answer key/
                     response_json = json.loads(json_string)
                     grade = response_json.get("grade", "Not found")
                     feedback = response_json.get("feedback", "No feedback provided.")
+                    formatted_feedback = _format_chemical_formulas(feedback)
                     report = GradingResult(
                         student_file=student_file,
                         grade=grade,
                         feedback=feedback,
                         report_file=None,
+                        formatted_feedback=formatted_feedback,
                     )
                     async with self:
                         self.grading_results.append(report)
@@ -279,6 +288,7 @@ Output: Table for the MCQ section of student answers compared to the answer key/
                         grade="API Error",
                         feedback=f"Failed to parse AI response: {e}",
                         report_file=None,
+                        formatted_feedback=f"Failed to parse AI response: {e}",
                     )
                     async with self:
                         self.grading_results.append(result)
@@ -319,6 +329,7 @@ Output: Table for the MCQ section of student answers compared to the answer key/
                         grade="API Error",
                         feedback=f"An error occurred with the Anthropic API: {e}",
                         report_file=None,
+                        formatted_feedback=f"An error occurred with the Anthropic API: {e}",
                     )
                     async with self:
                         self.grading_results.append(result)

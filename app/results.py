@@ -22,12 +22,9 @@ def _report_card(result: GradingResult) -> rx.Component:
                 class_name="flex justify-between items-center pb-3 border-b border-gray-200",
             ),
             rx.el.div(
-                rx.markdown(
-                    result["feedback"],
+                rx.html(
+                    result["formatted_feedback"],
                     class_name="prose prose-sm max-w-none text-gray-600",
-                    custom_attrs={
-                        "style": {"sub": {"fontFeatureSettings": "'sub' on"}}
-                    },
                 ),
                 class_name="mt-4 h-64 overflow-y-auto p-2 bg-gray-50 rounded-lg border",
             ),
