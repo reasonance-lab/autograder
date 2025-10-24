@@ -102,7 +102,8 @@ class GradingState(rx.State):
         "claude-3-5-haiku-20241022",
     ]
     selected_model: str = "claude-sonnet-4-5-20250929"
-    grading_instructions: str = ""
+    grading_instructions: str = """Grade the AP chemistry test student responses per the rubric/answer key. 
+Output: Table for the MCQ section of student answers compared to the answer key/rubric's answers and result (Correct/Wrong). For the FRQ section, output verbatim student answer followed by the answer key solution and evaluation of the student's answer solely based on the answer key solution. Supplement the evaluation with a grade. At the end of the report provide scores for MCQs, FRQs and total combined percentage."""
     answer_key_files: list[str] = []
     student_paper_files: list[str] = []
     is_grading: bool = False
